@@ -1,0 +1,309 @@
+kernel popcorn : ImageComputationKernel<ePixelWise>
+{
+//source pixels
+Image<eRead, eAccessRanged2D, eEdgeClamped> src;
+//depth pass feed
+Image<eRead, eAccessRandom> depthPass;
+//blur shape img. you could just use a roto paint for this
+Image<eRead, eAccessRandom> shape;
+Image<eWrite> dst; // the output image
+
+//what users see
+param:
+float2 focus;
+bool knownSubjDepth;
+float subjDepth;
+
+float focalLength;
+float fStop;
+
+float SD;
+//float convolveScaleMax;
+//float convolveScaleMin;
+bool seeDepth;
+bool uniformSD;
+//float innerSD;
+//float outerSD;
+//float innerMin;
+float innerMax;
+//float outerMin;
+float outerMax;
+float offset;
+
+//what we use :)
+local:
+ float pi;
+ float depthAtFocal;
+ float e;
+ float coc;
+ int2 _blurOff;
+ bool doSwirly;
+ bool radial;
+ float radius;
+ float H;
+ float Dn;
+ float Df;
+
+
+ ///////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+// In define(), parameters can be given labels and default values.
+void define() {
+
+ defineParam(seeDepth, "see effect scale", false);
+
+ defineParam(innerMax, "blur max in near field", 0.001f);
+ defineParam(outerMax, "blur max in far field", 2.0f);
+
+ defineParam(knownSubjDepth, "known subject dist?", true);
+ defineParam(subjDepth, "dist from subject in m", 5.0f);
+ defineParam(focus, "focal point", float2(100.0f, 100.0f));
+
+ defineParam(focalLength, "lens focal length", 50.0f);
+ defineParam(fStop, "f stop", 5.6f);
+ defineParam(SD, "standard deviation", 10.0f);
+
+ pi = 3.14159265359f;
+ e = 2.71828182845f;
+ coc = 0.03;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+void init() {
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+float getConvScalar(float x, float u){
+
+//make a bell curve from the inputs because it looks like the picture upside down
+//where x is focal range [normalized?] and y is the convolve matrix scalar value
+// ergo we feed in x and spit out y
+
+//it should have a y threshold between the min/max inputted
+//the trough (mean of the equation) should be the minimum when x is the focal point
+
+//u is the mean - this should be the depth at the focal point
+
+ float pi = 3.14159265359f;
+ float e = 2.71828182845f;
+ float coc = 0.003;
+
+// get hyperfocal distance
+
+ float H = (focalLength/1000) + (pow((focalLength/1000),2)/((fStop) * coc));
+// get close and far thresholds
+ float Dn = ((H * subjDepth)/(H + subjDepth));
+ float Df = ((H * subjDepth)/(H - subjDepth));
+
+if( x <= u){
+//make a bell curve !
+//two halves because small small brain gets SO upset by big function
+
+u -= Dn;
+float firstHalf = rsqrt(2*pi) * (1 / fabs(SD));
+float secondHalf =  exp( -0.5f * ( pow(x-u,2)/pow(SD,2) ));
+
+float output = firstHalf * secondHalf * -1;
+float range = innerMax - coc;
+float fu = fabs((rsqrt(2*pi) * (1 / fabs(SD)) *  pow(e , 0)));
+float a = range/fabs(fu);
+output += fu;
+output *= a;
+output += coc;
+if(output > innerMax)
+{
+   output = innerMax;
+}
+return output;
+}
+
+else if( x >= (u + Df)){
+
+u += Df;
+
+float firstHalf = rsqrt(2*pi) * (1 / fabs(SD));
+float secondHalf = exp( -0.5f * ( pow(x-u,2)/pow(SD,2) ));
+float output = firstHalf * secondHalf * -1;
+
+float range = outerMax - coc;
+
+// translate up by f(u) (lol eff you) so that f(u) is at 0
+float fu = fabs((rsqrt(2*pi) * (1 / fabs(SD)) *  pow(e , 0)));
+
+output += fu;
+
+//stretch by the ratio of graph size to range of max-min
+// so our graph is the right proportion :)
+float a = range/fabs(fu);
+output *= a;
+
+//get graph to trough @ smallest acceptable coc
+output += coc;
+
+if(output > outerMax)
+{
+   output = outerMax;
+}
+
+return output;
+}
+
+else {
+
+return 0.003;
+}
+
+}
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+float getangle(float2 input, float scale)
+{
+float2 center(input.x ,input.y);
+float dy = focus.y-center.y;
+float dx = focus.x-center.x;
+
+dx = (  cos(offset) * dx)    -    (sin(offset) * dy );
+dy = (  sin(offset) * dx)    +    (cos(offset) * dy );
+
+
+float angle;
+if (dy >= 0)
+{
+angle = acos( (dx * rsqrt( pow(dx,2) + pow(dy,2) ))  );
+} else {
+angle = (2 * 3.14159265359f) - acos( (dx * rsqrt( pow(dx,2) + pow(dy,2) ))  );
+}
+
+
+return angle;
+}
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void process(int2 pos) {
+
+SampleType(src) valueSum(0);
+ValueType(shape) blurSum(0);
+
+//we have depth pass being red :) its fun
+// get the zdepth at the focal point (u / mean)
+ValueType(depthPass) depthPassFoc = depthPass(focus[0], focus[1], 0);
+ValueType(depthPass) depthHere = depthPass(pos.x, pos.y, 0);
+float scale;
+float angle;
+
+
+//this should return z at the pixel in question- call it x
+
+if(knownSubjDepth)
+{
+  scale = getConvScalar(depthHere, subjDepth);
+}
+else { scale = getConvScalar(depthHere, depthPassFoc);}
+
+////////////////////////////////////////////////////////////
+if(scale!=0)
+{
+angle = getangle(float2(pos.x,pos.y), scale);
+
+//scale = 1/scale;
+//grab how big our blur is; how to resize/iterate the img (account for resize!)
+//x1,y
+
+float2 blurRad((shape.bounds.width()*scale),(shape.bounds.height()*scale));
+
+//offset from bottom left of the matrix to isolate
+    _blurOff[0] = shape.bounds.x1 + blurRad[0];
+    _blurOff[1] = shape.bounds.y1 + blurRad[1];
+
+//Set up the access for the src image- so we don't need to look at all of it :) !
+src.setRange(shape.bounds.x1, shape.bounds.y1, blurRad[0], blurRad[1]);
+//depthPass.setRange(shape.bounds.x1, shape.bounds.y1, blurRad[0], blurRad[1]);
+
+    //value type takes the whole pixel. we can do a sample type to get a vec4 rgba but this wqorks and hurts my head a bit less lol
+
+//we go over the blur img/matrix (therefore don't need to measure up/down)
+//bottom left -> topright except topright is the radius ends
+for(int j = shape.bounds.y1; j < blurRad[1]; ++j) {
+for(int i = shape.bounds.x1; i < blurRad[0]; ++i) {
+
+//here i should get the scale of i - (_blurOff[0]/2), j - (_blurOff[1])/2);
+// and compare it to our scale value
+
+ValueType(depthPass) kernelD = depthPass( i - (_blurOff[0]/2),  j - (_blurOff[1])/2, 0);
+float kernelScale = getConvScalar(kernelD, depthPassFoc);
+float depthDiff = 0.01;
+//depthDiff += (fabs(kernelScale-scale));
+
+
+ValueType(shape) blurVal(0);
+
+//get rotated value lol
+  if(doSwirly){
+//get rotated value lol
+float2 alteredCords = petzval(float2(i,j), scale, angle);
+    blurVal = bilinear(shape, (alteredCords.x)/scale,  -1 * ( (alteredCords.y)/scale), 1);
+  } else {
+    blurVal = bilinear(shape, i / scale,  -1 * ( j / scale ), 1);}
+
+
+  //if the pixel we're blurring by Isn't Black with no alpha
+        if((blurVal > 0)&& (depthDiff < 0.1)){
+        //ITS HERE. THIS BIT WILL BE THE ANSWER I THINK. I NEED TO CYCLE PROPERLY- RN
+              valueSum += bilinear(src, i - (_blurOff[0]/2), j - (_blurOff[1])/2)  * blurVal ;
+               //Update the filter sum with the weighted value
+               blurSum += blurVal;}
+
+
+}}
+
+ if (blurSum != 0){
+     valueSum /= blurSum;}
+
+if(seeDepth){
+  dst() = scale;}
+
+//sometimes, it will keep everything at zero, resulting in black striping. this ruins my life. it is no longer allowed.
+  else if(valueSum[3]== 0)
+  {
+        dst() = bilinear(src,pos.x/512,pos.y/512);
+  }
+else {
+//petzval(valueSum, focus);
+dst() = valueSum;}
+}
+////////////////////////////////////////////////////
+else if(seeDepth){
+  dst() = 0;}
+else
+{
+
+      dst() = bilinear(src,pos.x/512,pos.y/512);
+}
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+float2 petzval(float2 input, float scale, float angle){
+
+float cx = input.x;
+float cy = input.y;
+float2 center(cx,cy);
+
+
+//need to rotate dxdy around the center by the angle
+//this is hell: https://www.euclideanspace.com/maths/geometry/affine/aroundPoint/matrix2d/index.htm
+float x2 = ((cos(angle)*cx)-(-1*sin(angle)*cy));
+float y2 = ((sin(angle)*cx) + (cos(angle)*cy));
+
+//return the rotated soup
+return float2(x2,y2);
+
+}
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+};

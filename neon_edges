@@ -1,0 +1,116 @@
+kernel EdgyNode : public ImageComputationKernel<ePixelWise>
+{
+//source
+  Image<eRead, eAccessRanged2D, eEdgeClamped> imageIn; 
+//out
+  Image<eWrite, eAccessPoint> imageOut;          
+
+param: 
+float3x3 multiplierA;
+float3x3 multiplierB;
+float lumscale;
+float saturation;
+float alphaMult;
+bool premult;
+bool mergeOver;
+bool mergePlus;
+
+
+ local:
+
+
+  void define(){
+  defineParam(premult, "premult the outcome?", true);
+  defineParam(mergeOver, "merge over backplate?", false);
+  defineParam(mergePlus, "merge plus backplate?", false);
+
+
+  defineParam(multiplierA, "multiplication matrix A", float3x3(-1.0f,-2.0f,-1.0f,0.0f,0.0f,0.0f,1.0f,2.0f,1.0f));
+  defineParam(multiplierB, "multiplication matrix B", float3x3(-1.0f,-2.0f,-1.0f,0.0f,0.0f,0.0f,1.0f,2.0f,1.0f));
+
+  defineParam(lumscale, "luminance scale", 0.5f);
+  defineParam(alphaMult, "grade A", 2.0f);
+  defineParam(saturation, "saturation correction AFTER edge det.", 1.0f);
+
+
+
+}
+
+  void init()
+  {
+    imageIn.setRange(-1, -1, 1, 1);
+  }
+
+  void process(int2 pos)
+  {
+SampleType(imageIn) input = imageIn(pos.x/512,pos.y/512);
+
+//declare array
+    float4 valsA[9];
+    float4 valsB[9];
+//fill array with base vals
+    for (int j = -1, index = 0; j <= 1; ++j) {
+      for (int i = -1; i <= 1; ++i) { 
+        valsA[index] = imageIn(i, j);
+        valsB[index] = imageIn(i, j);
+
+        index += 1; 
+      }
+    }
+   
+// apply filter 0
+int mark = 0;
+for(int i = 0; i < 3; ++i)
+{
+  for(int j = 0; j < 3; ++j)
+    {
+          valsA[mark] *= multiplierA[i][j];
+          valsB[mark] *= multiplierB[i][j];
+    mark +=1;
+    }
+}
+
+
+float4 sumA = float4(0.0);
+float4 sumB = float4(0.0);
+
+for(int i=0; i<=8; ++i)
+{
+  sumA += valsA[i];
+  sumB += valsB[i];
+}
+
+float r = sqrt(pow(sumA[0],2) + pow(sumB[0],2));
+float g = sqrt(pow(sumA[1],2) + pow(sumB[1],2));
+float b = sqrt(pow(sumA[2],2) + pow(sumB[2],2));
+float lum = (0.2126*r + 0.7152*g + 0.0722*b);// * lumscale;
+
+    // Isolate the RGB components
+float3 srcPixel(r , g , b );
+float3 saturatedPixel = (srcPixel - lum) * saturation + lum;
+float alpha = lum*lumscale*alphaMult;
+
+float4 neon;
+    // Apply saturation
+
+if(premult){
+      neon = float4(saturatedPixel.x * alpha, saturatedPixel.y * alpha, saturatedPixel.z*alpha, alpha);
+    }
+else
+{
+      neon = float4(saturatedPixel.x, saturatedPixel.y, saturatedPixel.z, alpha);
+}
+
+if(mergeOver){
+//A+B(1-a)
+float4 out = input + (neon*(1-alpha));
+imageOut() = out;
+} else if(mergePlus){
+imageOut() = (neon + input);
+}
+else{
+imageOut() = neon;
+}
+
+  }
+};
